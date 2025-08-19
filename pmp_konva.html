@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>PMP λ₀-style demo (Konva.js)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://unpkg.com/konva@9/konva.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  body{ margin:0; background:#121216; color:#e8e8ee; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial }
+  #ui{ position:fixed; left:10px; top:10px; font-size:14px; line-height:1.4; z-index:2; }
+  #container{ position:relative; z-index:1; }
+  a{ color:#9ad }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div><b>PMP demo (Konva.js)</b></div>
+  <div>Left-click (or tap) anywhere to set the target</div>
+  <div id="info" style="margin-top:6px;"></div>
+</div>
+<div id="container"></div>
+
+<script>
+/* =========================
+   Config (change as you like)
+   ========================= */
+const N_DOF = 6;                       // 4..8
+const LINKS = [0.30,0.25,0.22,0.20,0.18,0.16,0.14,0.12].slice(0,N_DOF); // m
+const Wdiag = Array(N_DOF).fill(1.0);  // diagonal weights >0
+const Kpdiag = Array.from({length:N_DOF}, (_,i)=> 1.4 - 0.08*i); // posture stiffness
+const qStar  = Array.from({length:N_DOF}, (_,i)=> (i%2?+0.45:-0.30));   // preferred posture
+const Ktask = 10;                     // task-space gain (1/s)
+const DT = 1/120;                      // seconds
+const VEL_LIMIT = 5.0;                 // rad/s clamp
+const PIXELS_PER_M = 220;              // draw scale
+const WIDTH = 1100, HEIGHT = 700;
+const ORIGIN = {x: WIDTH/2, y: HEIGHT/2 + 120}; // screen coords (base)
+
+/* =========================
+   Utilities
+   ========================= */
+const wrapPi = a => ((a + Math.PI) % (2*Math.PI)) - Math.PI;
+
+function toPx(p){ return { x: ORIGIN.x + p.x*PIXELS_PER_M,
+                           y: ORIGIN.y - p.y*PIXELS_PER_M }; }
+function fromPx(p){ return { x:(p.x-ORIGIN.x)/PIXELS_PER_M,
+                              y:(ORIGIN.y-p.y)/PIXELS_PER_M }; }
+
+/* =========================
+   FK & Jacobian (planar)
+   ========================= */
+function fkPoints(q){
+  // returns { joints: [{x,y}... N+1], ee: {x,y} }
+  const th = []; let acc=0;
+  for(let i=0;i<q.length;i++){ acc += q[i]; th.push(acc); }
+  const joints = [{x:0,y:0}];
+  for(let i=0;i<q.length;i++){
+    joints.push({
+      x: joints[i].x + LINKS[i]*Math.cos(th[i]),
+      y: joints[i].y + LINKS[i]*Math.sin(th[i])
+    });
+  }
+  return { joints, ee: joints[joints.length-1] };
+}
+
+function jacobian(q){
+  // 2xN planar Jacobian for EE (x,y)
+  const th = []; let acc=0;
+  for(let i=0;i<q.length;i++){ acc += q[i]; th.push(acc); }
+  const N = q.length;
+  const Ls = LINKS.map((L,i)=> L*Math.sin(th[i]));
+  const Lc = LINKS.map((L,i)=> L*Math.cos(th[i]));
+  // suffix sums build columns efficiently
+  const Sx = Array(N), Sy = Array(N);
+  let sS=0, sC=0;
+  for(let j=N-1;j>=0;j--){ sS += Ls[j]; sC += Lc[j]; Sx[j] = -sS; Sy[j] = sC; }
+  const J = [Sx, Sy]; // 2 x N
+  return J;
+}
+
+/* =========================
+   Small linear algebra
+   ========================= */
+function diag(arr){ const n=arr.length, M=Array(n).fill(0).map(()=>Array(n).fill(0));
+  for(let i=0;i<n;i++) M[i][i]=arr[i]; return M; }
+function invDiag(arr){ return diag(arr.map(v=> 1/v)); }
+function matMul(A,B){ const m=A.length,k=B.length,n=B[0].length;
+  const C=Array(m).fill(0).map(()=>Array(n).fill(0));
+  for(let i=0;i<m;i++) for(let p=0;p<k;p++){
+    const a=A[i][p]; if(a===0) continue;
+    for(let j=0;j<n;j++) C[i][j]+= a*B[p][j];
+  }
+  return C;
+}
+function matVec(A,v){ const m=A.length,n=A[0].length, y=Array(m).fill(0);
+  for(let i=0;i<m;i++) for(let j=0;j<n;j++) y[i]+=A[i][j]*v[j];
+  return y;
+}
+function transpose(A){ const m=A.length,n=A[0].length;
+  const T=Array(n).fill(0).map(()=>Array(m).fill(0));
+  for(let i=0;i<m;i++) for(let j=0;j<n;j++) T[j][i]=A[i][j];
+  return T;
+}
+function matSub(A,B){ const m=A.length,n=A[0].length;
+  const C=Array(m).fill(0).map(()=>Array(n).fill(0));
+  for(let i=0;i<m;i++) for(let j=0;j<n;j++) C[i][j]=A[i][j]-B[i][j];
+  return C;
+}
+function eye(n){ const I=Array(n).fill(0).map(()=>Array(n).fill(0));
+  for(let i=0;i<n;i++) I[i][i]=1; return I; }
+// 2x2 inverse for (J W^{-1} J^T)^{-1}
+function inv2(M){
+  const [[a,b],[c,d]]=M; const det=a*d-b*c;
+  if(Math.abs(det) < 1e-12) throw new Error("Singular 2x2 (JW^{-1}J^T not invertible).");
+  const invDet = 1/det;
+  return [[ d*invDet, -b*invDet],
+          [-c*invDet,  a*invDet]];
+}
+
+/* =========================
+   PMP step (paper form, μ=0)
+   dot q = G xdot - (I - GJ) W^{-1} grad(h)
+   G = W^{-1} J^T (J W^{-1} J^T)^{-1}
+   grad(h) = Kp (q - q*)
+   ========================= */
+function pmpStep(q, xDes){
+  const { joints, ee:x } = fkPoints(q);
+  const J = jacobian(q);      // 2 x N
+  const N = q.length;
+
+  // Task velocity: xdot = K (x* - x)
+  const dx = [xDes.x - x.x, xDes.y - x.y];
+  const xdot = [ Ktask*dx[0], Ktask*dx[1] ];
+
+  // W^{-1} and grad(h) = Kp (q - q*)
+  const Winv = invDiag(Wdiag);                 // N x N
+  const gradH = q.map((qi,i)=> Kpdiag[i]*(qi - qStar[i])); // N
+
+  // G
+  const JT = transpose(J);                     // N x 2
+  const JWinv = matMul(J, Winv);               // 2 x N
+  const JWJt = matMul(JWinv, JT);              // 2 x 2
+  const JWJtInv = inv2(JWJt);                  // 2 x 2
+  const G = matMul( matMul(Winv, JT), JWJtInv ); // N x 2
+
+  // N = I - GJ
+  const I = eye(N);
+  const GJ = matMul(G, J);                     // N x N
+  const Nproj = matSub(I, GJ);
+
+  // qdot = G xdot - N W^{-1} gradH
+  const term1 = matVec(G, xdot);               // N
+  const term2 = matVec(Nproj, matVec(Winv, gradH)); // N
+  let qdot = term1.map((v,i)=> v - term2[i]);  // N
+
+  // Clamp & integrate
+  qdot = qdot.map(v => Math.max(-VEL_LIMIT, Math.min(VEL_LIMIT, v)));
+  const qNext = q.map((qi,i)=> wrapPi(qi + qdot[i]*DT));
+  return { qNext, joints, ee:x, qdot, xdot };
+}
+
+/* =========================
+   Konva scene
+   ========================= */
+const stage = new Konva.Stage({ container: 'container', width: WIDTH, height: HEIGHT });
+const layer = new Konva.Layer(); stage.add(layer);
+
+// Add a full-canvas transparent hit area so clicks always register
+const hitRect = new Konva.Rect({ x:0, y:0, width:WIDTH, height:HEIGHT, fill:'rgba(0,0,0,0)', listening:true });
+layer.add(hitRect);
+
+const baseDot = new Konva.Circle({ x: ORIGIN.x, y: ORIGIN.y, radius: 4, fill: '#bbb' });
+layer.add(baseDot);
+
+const targetMark = new Konva.Group();
+const tCirc = new Konva.Circle({ x:0,y:0, radius:8, stroke:'#ff5a5a', strokeWidth:2 });
+const tH = new Konva.Line({ points:[-10,0,10,0], stroke:'#ff5a5a', strokeWidth:2 });
+const tV = new Konva.Line({ points:[0,-10,0,10], stroke:'#ff5a5a', strokeWidth:2 });
+targetMark.add(tCirc, tH, tV);
+layer.add(targetMark);
+
+// Links & joints
+const linkLines = [];
+const jointDots = [];
+for(let i=0;i<N_DOF;i++){
+  const ln = new Konva.Line({ points:[0,0,0,0], stroke:'#e8e8ee', strokeWidth:5, lineCap:'round' });
+  linkLines.push(ln); layer.add(ln);
+  const jd = new Konva.Circle({ x:0,y:0, radius:6, fill:'#7ab4ff' });
+  jointDots.push(jd); layer.add(jd);
+}
+const eeDot = new Konva.Circle({ x:0,y:0, radius:7, fill:'#ffdC78' });
+layer.add(eeDot);
+
+/* =========================
+   State & interaction
+   ========================= */
+let q = Array.from({length:N_DOF}, (_,i)=> 0.20 - 0.06*i); // initial joints
+let { ee } = fkPoints(q);
+let xDes = { x: ee.x, y: ee.y };
+
+stage.on('pointerdown', (e)=>{
+  // Ignore UI clicks (pointer must have stage position)
+  const pos = stage.getPointerPosition();
+  if (!pos) return;
+  // If you only want left-button, uncomment next line:
+  // if (e.evt && typeof e.evt.button !== 'undefined' && e.evt.button !== 0) return;
+
+  xDes = fromPx(pos);
+  targetMark.position(toPx(xDes));
+  layer.batchDraw();
+});
+
+/* =========================
+   Rendering
+   ========================= */
+function drawRobot(joints, ee){
+  for(let i=0;i<joints.length-1;i++){
+    const a = toPx(joints[i]), b = toPx(joints[i+1]);
+    linkLines[i].points([a.x,a.y,b.x,b.y]);
+    jointDots[i].position(a);
+  }
+  jointDots[joints.length-2].position(toPx(joints[joints.length-2]));
+  eeDot.position(toPx(ee));
+  layer.batchDraw();
+}
+
+// place initial target marker
+targetMark.position(toPx(xDes));
+layer.draw();
+
+/* =========================
+   Main loop
+   ========================= */
+const info = document.getElementById('info');
+(function animate(){
+  try{
+    const { qNext, joints, ee:eeNow, qdot, xdot } = pmpStep(q, xDes);
+    q = qNext;
+    drawRobot(joints, eeNow);
+    info.textContent =
+      `DoF: ${N_DOF} | Target: [${xDes.x.toFixed(3)}, ${xDes.y.toFixed(3)}] ` +
+      `EE: [${eeNow.x.toFixed(3)}, ${eeNow.y.toFixed(3)}] | ‖xdot‖=${Math.hypot(...xdot).toFixed(3)}`;
+  }catch(err){
+    info.textContent = 'Singularity in (J W^{-1} J^T)^{-1}. Try another target or tweak W/K.';
+  }
+  requestAnimationFrame(animate);
+})();
+</script>
+</body>
+</html>

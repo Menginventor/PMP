@@ -25,57 +25,50 @@ Kp_diag = np.array([1.5, 1.2, 1.0, 0.8], dtype=float)
 K_task = 2.5
 
 # DLS regularization for (J W^{-1} J^T) inverse
-#MU = 1e-3
 MU = 0
 # Integration
 DT = 1/120.0  # seconds
 VEL_LIMIT = 4.0  # rad/s clamp
 FRICTION_CLAMP = True  # clamp dot q
 
+# Trace
+TRACE_LIFETIME = 2.0   # seconds before trace fades
+TRACE_INTERVAL = 3     # frames between samples
+
 # Colors
 BG = (18, 18, 22)
 ARM = (240, 240, 240)
 JOINT = (120, 180, 255)
 TARGET = (255, 90, 90)
-NULL_ARROW = (120, 255, 160)
 TEXT = (200, 200, 200)
+TRACE_COLOR = (255, 200, 80)
 
 # ===========================
 # Helper math
 # ===========================
 def wrap_angle(a):
-    """Wrap to [-pi, pi]."""
     return (a + np.pi) % (2*np.pi) - np.pi
 
 def fk_points(q):
-    """Forward kinematics: return list of joint points (px) and end-effector pos (m)."""
-    # cumulative angles
     th1, th2, th3, th4 = np.cumsum(q)
-    # segment vectors in meters
     p1 = LINKS[0]*np.array([math.cos(th1), math.sin(th1)])
     p2 = LINKS[1]*np.array([math.cos(th2), math.sin(th2)])
     p3 = LINKS[2]*np.array([math.cos(th3), math.sin(th3)])
     p4 = LINKS[3]*np.array([math.cos(th4), math.sin(th4)])
-    # joint/world positions (meters)
     j0 = np.array([0.0, 0.0])
     j1 = j0 + p1
     j2 = j1 + p2
     j3 = j2 + p3
     ee = j3 + p4
     joints_m = [j0, j1, j2, j3, ee]
-    # for drawing convert to pixels
     joints_px = [to_px(p) for p in joints_m]
     return joints_m, joints_px, ee
 
 def jacobian(q):
-    """Planar 4-DoF Jacobian for x,y end-effector (2x4)."""
     th = np.cumsum(q)
     s = np.sin(th); c = np.cos(th)
     L = LINKS
-    # position EE
-    # Each column j is partial derivative of EE wrt q_j
     J = np.zeros((2, 4))
-    # d(EE)/dq1 accumulates contributions from all links
     J[:,0] = [-L[0]*s[0] - L[1]*s[1] - L[2]*s[2] - L[3]*s[3],
                L[0]*c[0] + L[1]*c[1] + L[2]*c[2] + L[3]*c[3]]
     J[:,1] = [-L[1]*s[1] - L[2]*s[2] - L[3]*s[3],
@@ -86,51 +79,39 @@ def jacobian(q):
     return J
 
 def to_px(p_m):
-    """Meters (world) -> screen pixels (y flipped)."""
     return ORIGIN + np.array([p_m[0]*PIXELS_PER_M, -p_m[1]*PIXELS_PER_M])
 
 def from_px(p_px):
-    """Screen pixels -> meters (world)."""
     v = (np.array(p_px, dtype=float) - ORIGIN)/PIXELS_PER_M
     v[1] = -v[1]
     return v
 
 # ===========================
-# PMP step (closed-form; no explicit lambda)
-# dot q = G dx_d + (I - GJ) W^{-1} ∇h
+# PMP step
 # ===========================
 def pmp_step(q, x_des, W_diag, K_task, Kp_diag, q_star, mu=1e-3, dt=DT):
-    # FK and Jacobian
     (joints_m, joints_px, x) = fk_points(q)
-    J = jacobian(q)                       # 2x4
-    W = np.diag(W_diag)                   # 4x4
-    Winv = np.diag(1.0/W_diag)            # 4x4
+    J = jacobian(q)
+    W = np.diag(W_diag)
+    Winv = np.diag(1.0/W_diag)
 
-    # Task velocity (spring in task space)
-    dx = x_des - x                        # 2
-    xdot = K_task * dx                    # 2
+    dx = x_des - x
+    xdot = K_task * dx
 
-    # Null-space posture torque (attractive)
-    grad_h = - np.diag(Kp_diag) @ (q - q_star)   # 4
+    grad_h = - np.diag(Kp_diag) @ (q - q_star)
 
-    # Weighted pseudoinverse with DLS
-    # G = W^{-1} J^T (J W^{-1} J^T + mu I)^{-1}
-    JWJt = J @ Winv @ J.T                 # 2x2
+    JWJt = J @ Winv @ J.T
     A = JWJt + mu * np.eye(2)
     Ainv = np.linalg.inv(A)
-    G = Winv @ J.T @ Ainv                 # 4x2
+    G = Winv @ J.T @ Ainv
 
-    # Null-space projector N = I - GJ
-    N = np.eye(4) - G @ J                 # 4x4
+    N = np.eye(4) - G @ J
 
-    # PMP velocity
-    qdot = G @ xdot + N @ (Winv @ grad_h) # 4
+    qdot = G @ xdot + N @ (Winv @ grad_h)
 
-    # Optional velocity clamp
     if FRICTION_CLAMP:
         qdot = np.clip(qdot, -VEL_LIMIT, VEL_LIMIT)
 
-    # Integrate
     q_next = q + qdot * dt
     q_next = np.array([wrap_angle(a) for a in q_next])
     return q_next, joints_px, x, xdot, grad_h, N
@@ -157,6 +138,16 @@ def draw_target(screen, x_des):
     pygame.draw.line(screen, TARGET, p + np.array([-8,0]), p + np.array([8,0]), 2)
     pygame.draw.line(screen, TARGET, p + np.array([0,-8]), p + np.array([0,8]), 2)
 
+def draw_trace(screen, trace, now):
+    for (px, t0) in trace:
+        age = now - t0
+        if age < TRACE_LIFETIME:
+            alpha = max(0, 255 * (1 - age/TRACE_LIFETIME))
+            col = (TRACE_COLOR[0], TRACE_COLOR[1], TRACE_COLOR[2], int(alpha))
+            s = pygame.Surface((4,4), pygame.SRCALPHA)
+            pygame.draw.circle(s, col, (2,2), 2)
+            screen.blit(s, px - np.array([2,2]))
+
 # ===========================
 # Main
 # ===========================
@@ -166,34 +157,40 @@ def main():
     pygame.display.set_caption("PMP demo — 4-DoF planar manipulator")
     clock = pygame.time.Clock()
 
-    # Initial config
     q = np.array([0.2, 0.6, -0.5, 0.2], dtype=float)
-
-    # Initial target at current EE
     joints_m, joints_px, ee = fk_points(q)
     x_des = ee.copy()
 
+    trace = []
+    frame_count = 0
+    start_time = pygame.time.get_ticks()/1000.0
+
     running = True
     while running:
-        # Events
+        now = pygame.time.get_ticks()/1000.0 - start_time
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                # Left click sets new target in meters
                 x_des = from_px(event.pos)
 
-        # PMP step
         q, joints_px, x, xdot, grad_h, N = pmp_step(
             q, x_des, W_diag, K_task, Kp_diag, q_star, mu=MU, dt=DT
         )
 
-        # Draw
+        # Add trace point every few frames
+        frame_count += 1
+        if frame_count % TRACE_INTERVAL == 0:
+            trace.append((joints_px[-1], now))
+        # Remove expired points
+        trace = [(p,t) for (p,t) in trace if now - t < TRACE_LIFETIME]
+
         screen.fill(BG)
         draw_target(screen, x_des)
         draw_arm(screen, joints_px)
+        draw_trace(screen, trace, now)
 
-        # Info
         draw_text(screen, f"Target (m): [{x_des[0]:+.3f}, {x_des[1]:+.3f}]", (10, 10))
         draw_text(screen, f"EE (m):     [{x[0]:+.3f}, {x[1]:+.3f}]", (10, 32))
         draw_text(screen, "Controls: Left-click to set target", (10, 56))
